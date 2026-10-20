@@ -1,0 +1,6 @@
+{
+  "name": "sessions",
+  "version": "0.1.0",
+  "description": "Claude Code のセッション一覧ペインと、AI による一括リネーム",
+  "types": "./types/index.d.ts"
+}

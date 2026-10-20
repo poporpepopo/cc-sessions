@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""ccs — Claude Code のセッション一覧を一目で見る
+
+  ccs            最近のセッション 30 件
+  ccs -a         全件
+  ccs -n 50      件数指定
+  ccs 検索語     タイトル/最後のプロンプト/ディレクトリで絞り込み
+  ccs -r 3       一覧の 3 番を、そのディレクトリで claude --resume する
+  ccs --json     JSON で出力 (Claude Code の /sessions mod が使う)
+  ccs --set-title ID タイトル   セッション名を付ける (/rename と同じ記録)
+"""
+import argparse, json, os, sys, time, unicodedata
+from pathlib import Path
+
+HOME = Path.home()
+CLAUDE = HOME / ".claude"
+CACHE = HOME / ".cache" / "ccs" / "index.json"
+CACHE_VERSION = 2  # scan() の中身を変えたら上げる
+
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+GREEN, YELLOW, CYAN = "\033[32m", "\033[33m", "\033[36m"
+
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def fit(s, w):
+    s = " ".join((s or "").split())
+    out, cur = "", 0
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if cur + cw > w - (1 if width(s) > w else 0):
+            return out + "…" + " " * (w - cur - 1)
+        out += c
+        cur += cw
+    return out + " " * (w - cur)
+
+
+META = {  # 行の種類: (info のフィールド, JSON のキー)
+    "custom-title": ("title", "customTitle"),
+    "ai-title": ("ai_title", "aiTitle"),
+    "last-prompt": ("last", "lastPrompt"),
+    "cost-state": ("cost", "totalCostUSD"),
+}
+
+
+def scan(path):
+    info = {"title": "", "ai_title": "", "first": "", "last": "", "cwd": "",
+            "branch": "", "cost": None, "turns": 0}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            head = line[:40]
+            meta = next((k for k in META if f'"{k}"' in head), None)
+            if meta:
+                try:  # 書き込み途中などで壊れた行は飛ばす
+                    field, key = META[meta]
+                    info[field] = json.loads(line).get(key, info[field])
+                except ValueError:
+                    pass
+            elif '"type":"user"' in line:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not info["cwd"]:
+                    info["cwd"] = d.get("cwd", "")
+                if d.get("gitBranch"):
+                    info["branch"] = d["gitBranch"]
+                c = (d.get("message") or {}).get("content")
+                if isinstance(c, str) and not d.get("isMeta") and not c.startswith("<"):
+                    info["turns"] += 1
+                    if not info["first"]:
+                        info["first"] = c
+    return info
+
+
+def load_index():
+    try:
+        saved = json.loads(CACHE.read_text())
+        cache = saved["files"] if saved.get("v") == CACHE_VERSION else {}
+    except Exception:
+        cache = {}
+    out, changed = [], False
+    for p in (CLAUDE / "projects").glob("*/*.jsonl"):
+        st = p.stat()
+        key = str(p)
+        ent = cache.get(key)
+        if not ent or ent["mtime"] != st.st_mtime or ent["size"] != st.st_size:
+            try:
+                ent = {"mtime": st.st_mtime, "size": st.st_size, **scan(p)}
+            except OSError:
+                continue
+            cache[key] = ent
+            changed = True
+        if not ent["cwd"]:
+            ent["cwd"] = "/" + p.parent.name.lstrip("-").replace("-", "/")
+        out.append({"id": p.stem, **ent})
+    if changed:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        live = {str(p) for p in (CLAUDE / "projects").glob("*/*.jsonl")}
+        files = {k: v for k, v in cache.items() if k in live}
+        tmp = CACHE.with_suffix(f".{os.getpid()}.tmp")  # 同時に走っても衝突しないよう一意に
+        try:
+            tmp.write_text(json.dumps({"v": CACHE_VERSION, "files": files}))
+            os.replace(tmp, CACHE)
+        except OSError:
+            pass  # キャッシュは保存できなくても一覧は返す
+    return out
+
+
+def set_title(path, sid, title):
+    """/rename と同じ記録を残す: 詰めた JSON の custom-title と agent-name の行、
+    それに <sid>/custom-title.json。並び順が変わらないよう更新日時は元に戻す。"""
+    st = path.stat()
+    dump = lambda o: json.dumps(o, ensure_ascii=False, separators=(",", ":"))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(dump({"type": "custom-title", "customTitle": title, "sessionId": sid}) + "\n")
+        f.write(dump({"type": "agent-name", "agentName": title, "sessionId": sid}) + "\n")
+    write_sidecar(path, title)
+    os.utime(path, (st.st_atime, st.st_mtime))
+
+
+def write_sidecar(path, title):
+    side = path.with_suffix("")
+    side.mkdir(mode=0o700, exist_ok=True)
+    tmp = side / f".custom-title.json.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"customTitle": title}, ensure_ascii=False, separators=(",", ":")))
+    os.replace(tmp, side / "custom-title.json")
+
+
+def live_sessions():
+    live = {}
+    for p in (CLAUDE / "sessions").glob("*.json"):
+        try:
+            d = json.loads(p.read_text())
+            os.kill(d["pid"], 0)
+        except (ProcessLookupError, ValueError, KeyError, OSError):
+            continue
+        live[d.get("sessionId")] = d
+    return live
+
+
+def ago(t):
+    s = time.time() - t
+    if s < 60: return "たった今"
+    if s < 3600: return f"{int(s // 60)}分前"
+    if s < 86400: return f"{int(s // 3600)}時間前"
+    if s < 86400 * 30: return f"{int(s // 86400)}日前"
+    return time.strftime("%Y-%m-%d", time.localtime(t))
+
+
+def short_dir(d):
+    h = str(HOME)
+    if "/Application Support/Claude/scratch" in d or "-scratch-workspaces-" in d:
+        return "(scratch)"
+    return "~" + d[len(h):] if d.startswith(h) else d
+
+
+def main():
+    global DIM, BOLD, RESET, GREEN, YELLOW, CYAN
+    ap = argparse.ArgumentParser(description="Claude Code セッション一覧")
+    ap.add_argument("query", nargs="*", help="絞り込み語")
+    ap.add_argument("-a", "--all", action="store_true", help="全件表示")
+    ap.add_argument("-n", type=int, default=30, help="表示件数 (既定 30)")
+    ap.add_argument("-r", "--resume", type=int, metavar="N", help="N 番を再開")
+    ap.add_argument("--json", action="store_true", help="JSON で出力")
+    ap.add_argument("--fallback", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--fix-titles", action="store_true",
+                    help="古い形式の名前や custom-title.json と食い違う名前を /rename の形式で書き直す")
+    ap.add_argument("--set-title", nargs=2, metavar=("ID", "TITLE"), help="セッション名を付ける")
+    a = ap.parse_args()
+    if a.fallback:
+        # /sessions の引数から来るので、一覧表示以外の操作は受け付けない
+        if a.set_title or a.fix_titles or a.resume is not None:
+            sys.exit("ccs: --fallback では一覧表示しかできません")
+        if a.query[:1] == ["rename"]:
+            a.query = []  # /sessions rename の代替表示: 絞り込みには使わない
+
+    if a.fix_titles:
+        fixed = 0
+        for p in (CLAUDE / "projects").glob("*/*.jsonl"):
+            last = None
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"custom-title"' in line[:40]:
+                        last = line
+            if not last:
+                continue
+            try:
+                title = json.loads(last).get("customTitle", "")
+            except ValueError:
+                print(f"{p.stem[:8]}  (名前の行が壊れているので飛ばしました)")
+                continue
+            try:
+                side = json.loads((p.with_suffix("") / "custom-title.json").read_text())
+            except Exception:
+                side = {}
+            compact = last.startswith('{"type":"custom-title","customTitle":"')
+            if not title or (compact and side.get("customTitle") == title):
+                continue
+            if compact:
+                write_sidecar(p, title)  # 行は /rename 形式なので、別ファイルだけ足す
+            else:
+                set_title(p, p.stem, title)
+            fixed += 1
+            print(f"{p.stem[:8]}  {title}")
+        print(f"{fixed} 件を書き直しました")
+        return
+
+    if a.set_title:
+        sid, title = a.set_title
+        if title == "-":  # 「-」で始まる名前も渡せるよう stdin から読む
+            title = sys.stdin.read()
+        title = " ".join(title.split())
+        if not title:
+            sys.exit("ccs: 名前が空です")
+        hits = list((CLAUDE / "projects").glob(f"*/{sid}.jsonl"))
+        if len(hits) != 1:
+            sys.exit(f"ccs: セッション {sid} が見つかりません")
+        set_title(hits[0], sid, title)
+        return
+
+    rows = sorted(load_index(), key=lambda r: r["mtime"], reverse=True)
+    live = live_sessions()
+    q = " ".join(a.query).lower()
+    if q:
+        rows = [r for r in rows if q in " ".join(
+            [r["title"], r["ai_title"], r["first"], r["last"], r["cwd"], r["id"]]).lower()]
+    if not a.all:
+        rows = rows[: a.n]
+
+    if a.json:
+        for r in rows:
+            s = live.get(r["id"])
+            r["status"] = (s.get("status") or "idle") if s else ""
+            r["kind"] = (s.get("kind") or "") if s else ""  # bg ならデーモン上で動いている
+            r["place"] = short_dir(r["cwd"])
+            r["ago"] = ago(r["mtime"])
+        json.dump(rows, sys.stdout, ensure_ascii=False)
+        return
+
+    if a.resume is not None:
+        if not 1 <= a.resume <= len(rows):
+            sys.exit(f"ccs: {a.resume} 番はありません")
+        r = rows[a.resume - 1]
+        if os.path.isdir(r["cwd"]):
+            os.chdir(r["cwd"])
+        print(f"{DIM}cd {r['cwd']} && claude --resume {r['id']}{RESET}")
+        os.execvp("claude", ["claude", "--resume", r["id"]])
+
+    tty = sys.stdout.isatty()
+    cols = os.get_terminal_size().columns if tty else 160
+    if not tty:
+        DIM = BOLD = RESET = GREEN = YELLOW = CYAN = ""
+
+    # 列幅: # 3 | 状態 2 | 更新 9 | 場所 22 | タイトル 可変 | 最後のプロンプト 可変
+    fixed = 3 + 1 + 2 + 1 + 9 + 1 + 22 + 2
+    rest = max(cols - fixed, 30)
+    tw = min(max(rest * 2 // 5, 20), 40)
+    lw = rest - tw - 2
+
+    print(f"{BOLD}{'#':>3}    {fit('更新', 9)} {fit('場所', 22)}  {fit('タイトル', tw)}  最後のプロンプト{RESET}")
+    for i, r in enumerate(rows, 1):
+        s = live.get(r["id"])
+        if s and s.get("status") == "busy":
+            mark = f"{GREEN}●{RESET} "
+        elif s:
+            mark = f"{YELLOW}○{RESET} "
+        else:
+            mark = "  "
+        title = r["title"] or r["ai_title"] or r["first"] or "(空)"
+        place = short_dir(r["cwd"]) + (f" [{r['branch']}]" if r["branch"] not in ("", "HEAD") else "")
+        print(f"{DIM}{i:>3}{RESET} {mark} {DIM}{fit(ago(r['mtime']), 9)}{RESET} "
+              f"{CYAN}{fit(place, 22)}{RESET}  {BOLD}{fit(title, tw)}{RESET}  "
+              f"{DIM}{fit(r['last'] or r['first'], lw)}{RESET}")
+    if tty:
+        print(f"\n{DIM}{GREEN}●{RESET}{DIM} 実行中  {YELLOW}○{RESET}{DIM} 起動中(待機)   "
+              f"再開: ccs -r 番号   絞り込み: ccs 語{RESET}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
