@@ -7,6 +7,8 @@ allowed-tools: Bash(~/.local/bin/ccs --fallback:*)
 <!--
 通常は ~/Developer/cc-sessions の mod がこのコマンドに割り込み、ペインで一覧を開く
 (このファイルの中身はモデルに渡らない)。mod が読み込まれていないときだけ、以下が使われる。
+~/.local/bin/ccs は、macOS では bin/ccs へのリンク、Windows では extras/install-windows.ps1 が置く
+Git Bash 用のラッパー (! の行は Windows でも Git Bash で動く)。どちらも同じ書き方で呼べる。
 -->
 Claude Code のセッション一覧です (mod が読み込まれていないため簡易表示)。引数: `$ARGUMENTS`
 

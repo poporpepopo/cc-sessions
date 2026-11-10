@@ -31,11 +31,19 @@ const RUN = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, 
 type Call = { argv: string[]; stdin?: string }
 
 // ccs・モデル・ペインを差し替える。placed=false でペインが描けない環境を模す
-function world(on: On, opts: { modelText?: string; placed?: boolean; ccsFails?: boolean; noHome?: boolean } = {}) {
+// windows=true で Windows (環境変数 OS が Windows_NT) を模す。run で process.run の結果を argv ごとに変える
+type Opts = {
+  modelText?: string; placed?: boolean; ccsFails?: boolean; noHome?: boolean; windows?: boolean
+  run?: (argv: string[]) => { exitCode?: number; stderr?: string } | undefined
+}
+
+function world(on: On, opts: Opts = {}) {
   const calls: Call[] = []
   const renamed: string[] = []
   let modelCalls = 0
-  on('env.get', async () => ({ value: opts.noHome ? undefined : '/Users/me' }) as never)
+  on('env.get', async (_$, e) => ({
+    value: e.name === 'OS' ? (opts.windows ? 'Windows_NT' : undefined) : opts.noHome ? undefined : '/Users/me',
+  }) as never)
   on('session.id', async () => ({ value: 'aaa' })) // このセッション自身は aaa
   on('command.run', { command: 'rename' }, async (_$, e) => {
     renamed.push(e.args)
@@ -44,8 +52,9 @@ function world(on: On, opts: { modelText?: string; placed?: boolean; ccsFails?: 
   on('process.run', async (_$, e) => {
     calls.push({ argv: [...e.argv], stdin: e.init?.stdin })
     if (opts.ccsFails) throw new Error('spawn ENOENT')
-    const out = e.argv[1] === '--json' ? JSON.stringify(ROWS) : e.argv[1] === '--fallback' ? 'TABLE' : ''
-    return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const out = e.argv.includes('--json') ? JSON.stringify(ROWS) : e.argv.includes('--fallback') ? 'TABLE' : ''
+    const over = opts.run?.([...e.argv]) // 投げれば「起動できない」
+    return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false, ...over } }
   })
   on('model.complete', async () => (modelCalls++, {
     value: {
@@ -59,8 +68,9 @@ function world(on: On, opts: { modelText?: string; placed?: boolean; ccsFails?: 
   const toasts: string[] = []
   on('ui.status', async () => ({ value: undefined }))
   on('ui.toast', async (_$, e) => (toasts.push(e.text), { value: undefined }))
-  on('ui.copy', async () => ({ value: {} }) as never)
-  return { calls, renamed, toasts, models: () => modelCalls }
+  const copied: string[] = []
+  on('ui.copy', async (_$, e) => (copied.push(e.text), { value: {} }) as never)
+  return { calls, renamed, toasts, copied, models: () => modelCalls }
 }
 
 test('行を押すと新しいウィンドウで開く。自分自身と別の場所で開いているものは開かない', async ($, on) => {
@@ -84,6 +94,69 @@ test('行を押すと新しいウィンドウで開く。自分自身と別の�
   // デーモン上で動いているものは --resume で接続し直せるので開く
   await ui.press({ key: 'eee' })
   expect(osa().length).toBe(2)
+})
+
+test('osascript が失敗したら、シェルに貼れる再開コマンドをコピーする', async ($, on) => {
+  const { toasts, copied } = world(on, { run: argv => (argv[0] === 'osascript' ? { exitCode: 1, stderr: 'not allowed' } : undefined) })
+  await $.command.run({ ...RUN, command: 'sessions', args: '' })
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'ddd' })
+  expect(toasts.at(-1)).toContain('再開コマンドをコピーしました (not allowed)')
+  expect(copied).toEqual([`cd '/Users/me/it'\\''s' && claude --resume 'ddd'`])
+})
+
+test('Windows では bin/ccs を py -3 で動かし、行を押すと ccs --open-window で開く', async ($, on) => {
+  const { calls, toasts, copied } = world(on, { windows: true })
+  await $.command.run({ ...RUN, command: 'sessions', args: '' })
+  // 最初に py -3 が使えるか確かめてから、mod のフォルダの bin/ccs を絶対パスで渡す
+  expect(calls[0]?.argv).toEqual(['py', '-3', '-c', 'pass'])
+  expect(calls[1]?.argv.slice(0, 2)).toEqual(['py', '-3'])
+  expect(calls[1]?.argv[2]).toMatch(/[\\/]bin\\ccs$/)
+  expect(calls[1]?.argv.slice(3)).toEqual(['--json', '-a'])
+
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'aaa' })
+  await ui.press({ key: 'ccc' })
+  expect(calls.some(c => c.argv.includes('--open-window'))).toBe(false)
+  await ui.press({ key: 'ddd' })
+  expect(calls.at(-1)?.argv.slice(3)).toEqual(['--open-window', 'ddd'])
+  expect(toasts.at(-1)).toContain('新しいウィンドウで開きました')
+  expect(calls.some(c => c.argv[0] === 'osascript')).toBe(false)
+  expect(copied).toEqual([])
+})
+
+test('Windows で py が無ければ python で動かす', async ($, on) => {
+  const { calls } = world(on, {
+    windows: true,
+    run: argv => {
+      if (argv[0] === 'py') throw new Error('spawn py ENOENT')
+      return undefined
+    },
+  })
+  const res = await $.command.run({ ...RUN, command: 'sessions', args: '' })
+  expect(res.text).toContain('5 件')
+  expect(calls[1]?.argv[0]).toBe('python')
+  expect(calls[1]?.argv[1]).toMatch(/[\\/]bin\\ccs$/)
+  expect(calls[1]?.argv.slice(2)).toEqual(['--json', '-a'])
+})
+
+test('Windows で開けなければ PowerShell に貼れる再開コマンドをコピーし、開いている最中のものはコピーしない', async ($, on) => {
+  let code = 1
+  const { toasts, copied } = world(on, {
+    windows: true,
+    run: argv => (argv.includes('--open-window') ? { exitCode: code, stderr: 'ccs: claude が見つかりません' } : undefined),
+  })
+  await $.command.run({ ...RUN, command: 'sessions', args: '' })
+  const ui = await $.ui.mount(PANE)
+  await ui.press({ key: 'ddd' })
+  expect(toasts.at(-1)).toContain('再開コマンドをコピーしました (ccs: claude が見つかりません)')
+  // PowerShell の ' は '' と書く。&& は 5.1 に無いので ; で続ける
+  expect(copied).toEqual([`Set-Location -LiteralPath '/Users/me/it''s'; claude --resume 'ddd'`])
+
+  code = 3 // ccs が「別の場所で開いている」と答えた (一覧を読んだあとに開かれた)
+  await ui.press({ key: 'eee' })
+  expect(toasts.at(-1)).toContain('別のウィンドウかアプリで開いています')
+  expect(copied.length).toBe(1)
 })
 
 test('一覧を出し、AI 案を適用すると無名のセッションだけに名前を付ける', async ($, on) => {

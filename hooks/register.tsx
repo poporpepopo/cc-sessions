@@ -14,14 +14,36 @@ const note = atom({ plugin: 'sessions', key: 'note' } as const, '')
 
 const nameOf = (r: SessionRow) => r.title || r.ai_title || r.first || '(空)'
 
-// PATH に ~/.local/bin が無い起動 (GUI から開いた IDE など) でも動くよう絶対パスで呼ぶ
-let ccsPath = ''
-async function ccs($: EngineInterface, args: string[], stdin?: string) {
-  if (!ccsPath) {
-    const home = await $.env.get('HOME')
-    ccsPath = home ? `${home}/.local/bin/ccs` : 'ccs' // HOME が取れなければ PATH から探す
+// mod の API には OS を返すものが無いので、Windows が必ず設定している環境変数 OS で見分ける
+let win: boolean | undefined
+async function isWindows($: EngineInterface) {
+  if (win === undefined) win = (await $.env.get('OS')) === 'Windows_NT'
+  return win
+}
+
+// ccs を起動する argv の先頭
+let ccsArgv: string[] | undefined
+async function ccsCommand($: EngineInterface): Promise<string[]> {
+  if (await isWindows($)) {
+    // Windows は拡張子のないスクリプトを直接起動できないので、この mod の bin/ccs を Python で動かす。
+    // py (Python ランチャー) が無いか Python 3 を起動できなければ python を使う
+    const script = `${$.plugin.root}\\bin\\ccs`
+    try {
+      const probe = await $.process.run(['py', '-3', '-c', 'pass'], { timeoutMs: 15000 })
+      if (probe.exitCode === 0) return ['py', '-3', script]
+    } catch {
+      // py が無い
+    }
+    return ['python', script]
   }
-  return $.process.run([ccsPath, ...args], { timeoutMs: 60000, ...(stdin === undefined ? {} : { stdin }) })
+  // PATH に ~/.local/bin が無い起動 (GUI から開いた IDE など) でも動くよう絶対パスで呼ぶ
+  const home = await $.env.get('HOME')
+  return [home ? `${home}/.local/bin/ccs` : 'ccs'] // HOME が取れなければ PATH から探す
+}
+
+async function ccs($: EngineInterface, args: string[], stdin?: string) {
+  ccsArgv ??= await ccsCommand($)
+  return $.process.run([...ccsArgv, ...args], { timeoutMs: 60000, ...(stdin === undefined ? {} : { stdin }) })
 }
 
 async function load($: EngineInterface): Promise<SessionRow[]> {
@@ -128,25 +150,43 @@ async function openPane($: EngineInterface) {
 }
 
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
-const resumeCommand = (r: SessionRow) => `cd ${shq(r.cwd)} && claude --resume ${shq(r.id)}`
+const psq = (s: string) => `'${s.replace(/'/g, "''")}'`
+// 貼り付けて使う再開コマンド。Windows は PowerShell 用 (5.1 には && が無い)
+const resumeCommand = (r: SessionRow, windows = false) =>
+  windows
+    ? `Set-Location -LiteralPath ${psq(r.cwd)}; claude --resume ${psq(r.id)}`
+    : `cd ${shq(r.cwd)} && claude --resume ${shq(r.id)}`
 
-// ターミナル.app の新しいウィンドウでセッションを開く。新しいウィンドウはログインシェルから
-// 始まるので、このセッションの CLAUDE_CODE_SESSION_ID などは引き継がない
-export async function openInWindow($: EngineInterface, r: SessionRow): Promise<{ text: string; copy?: true }> {
+const LIVE = 'このセッションは別のウィンドウかアプリで開いています'
+
+// 新しいウィンドウでセッションを開く。開けなかったときは、コピーする再開コマンドを copy で返す。
+// macOS: ターミナル.app。新しいウィンドウはログインシェルから始まるので、このセッションの
+//   CLAUDE_CODE_SESSION_ID などは引き継がない
+// Windows: ccs --open-window が Windows Terminal (無ければ新しいコンソール) で開く。ここから wt.exe を
+//   直接起動しないのは、出力のパイプを握られて $.process.run が戻らなくなるのを避け、環境変数も外すため
+export async function openInWindow($: EngineInterface, r: SessionRow): Promise<{ text: string; copy?: string }> {
   if (r.id === (await $.session.id())) return { text: 'このセッションです' }
   // 別のウィンドウやデスクトップアプリで開いているものを二重に開くと記録が壊れる。
   // デーモン上 (bg) のものは --resume で接続し直せる
-  if (r.status && r.kind !== 'bg') return { text: 'このセッションは別のウィンドウかアプリで開いています' }
-  const as = resumeCommand(r).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  if (r.status && r.kind !== 'bg') return { text: LIVE }
+  const windows = await isWindows($)
+  const copy = resumeCommand(r, windows)
   try {
-    const out = await $.process.run(
-      ['osascript', '-e', `tell application "Terminal" to do script "${as}"`, '-e', 'tell application "Terminal" to activate'],
-      { timeoutMs: 15000 },
-    )
+    let out
+    if (windows) {
+      out = await ccs($, ['--open-window', r.id])
+      if (out.exitCode === 3) return { text: LIVE } // 一覧を読んだあとに、別の場所で開かれた
+    } else {
+      const as = copy.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+      out = await $.process.run(
+        ['osascript', '-e', `tell application "Terminal" to do script "${as}"`, '-e', 'tell application "Terminal" to activate'],
+        { timeoutMs: 15000 },
+      )
+    }
     if (out.exitCode === 0) return { text: `新しいウィンドウで開きました: ${nameOf(r)}` }
-    return { text: `開けなかったので再開コマンドをコピーしました (${out.stderr.trim().slice(0, 80)})`, copy: true }
+    return { text: `開けなかったので再開コマンドをコピーしました (${out.stderr.trim().slice(0, 80)})`, copy }
   } catch (err) {
-    return { text: `開けなかったので再開コマンドをコピーしました (${err instanceof Error ? err.message : String(err)})`, copy: true }
+    return { text: `開けなかったので再開コマンドをコピーしました (${err instanceof Error ? err.message : String(err)})`, copy }
   }
 }
 
@@ -335,7 +375,7 @@ export const register: Register = on => {
             plain
             onPress={async press => {
               const msg = await openInWindow($, r)
-              if (msg.copy) await $.ui.copy({ text: resumeCommand(r), surface: press.surface })
+              if (msg.copy) await $.ui.copy({ text: msg.copy, surface: press.surface })
               $.ui.toast(msg.text)
             }}
           >
