@@ -112,3 +112,7 @@ claude plugin test .
 ## 関連
 
 [cc-autotitle](https://github.com/poporpepopo/cc-autotitle): 名前のないセッションに、ターンが終わったときに自動で名前を付ける mod。`ccs` を使います。
+
+## ライセンス
+
+MIT。[LICENSE](LICENSE) を参照。
